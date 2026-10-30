@@ -54,6 +54,24 @@ END TEMPLATE-->
 *None yet*
 
 
+## 283.1.5
+
+### Breaking changes
+
+* ImageSharp's dynamic/automatic decoder detection code (used in Image.Load()) no longer includes TIFF (due to security vulnerabilities)
+
+
+## 283.1.0
+
+### New features
+
+* The `Color` API now includes a `bool TryFromHex(ReadOnlySpan<char> hexColor, out Color color)` signature for returning a `bool` and `out Color` instead of a `Color?`.
+
+### Other
+
+* The `Color` API is now better documented.
+
+
 ## 283.0.0
 
 ### Breaking changes
