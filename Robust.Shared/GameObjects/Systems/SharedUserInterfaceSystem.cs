@@ -41,66 +41,10 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
 
     private ActorRangeCheckJob _rangeJob;
 
-    /// Update type to apply
-    private enum QueuedUpdate
-    {
-        /// Upen a UI
-        Open,
-        /// Apply new state to the UI
-        ApplyState,
-        /// Close the UI
-        Close
-    };
-
-    #region Starlight
-    private static readonly Histogram UpdateHistogram = Metrics.CreateHistogram(
-        "robust_bui_update_usage",
-        "Time spent in Update per phase",
-        new HistogramConfiguration
-        {
-            LabelNames = new[] { "phase" },
-            Buckets = Histogram.ExponentialBuckets(0.000_001, 1.5, 25)
-        });
-
-    private static readonly Histogram SetStateHistogram = Metrics.CreateHistogram(
-        "robust_bui_set_state_usage",
-        "Time spent in SetUiState per BUI type",
-        new HistogramConfiguration
-        {
-            LabelNames = new[] { "bui" },
-            Buckets = Histogram.ExponentialBuckets(0.000_001, 1.5, 25)
-        });
-
-    private static readonly Histogram RangeCheckHistogram = Metrics.CreateHistogram(
-        "robust_bui_range_check_usage",
-        "Time spent in range checks per BUI key type",
-        new HistogramConfiguration
-        {
-            LabelNames = new[] { "bui" },
-            Buckets = Histogram.ExponentialBuckets(0.000_001, 1.5, 25)
-        });
-
-    // The three 'phases' of the Update method.
-    private static readonly Histogram.Child MonitorRangeQuery = UpdateHistogram.WithLabels("RangeQuery");
-    private static readonly Histogram.Child MonitorRangeParallel = UpdateHistogram.WithLabels("RangeParallel");
-    private static readonly Histogram.Child MonitorRangeClose = UpdateHistogram.WithLabels("RangeClose");
-
-    // Reused histogram children per BUI / BUI key type.
-    private readonly Dictionary<Type, Histogram.Child> _setStateMonitors = new();
-    private readonly Dictionary<Type, Histogram.Child> _rangeCheckMonitors = new();
-
-    private readonly Stopwatch _stopwatch = new();
-
-    private bool _globalMetricsEnabled;
-    private bool _granularUiSystemMetricsEnabled;
-    private bool MetricsEnabled => _globalMetricsEnabled && _granularUiSystemMetricsEnabled;
-
-    #endregion Starlight
-
     /// <summary>
     /// Defer BUIs during state handling so client doesn't spam a BUI constantly during prediction.
     /// </summary>
-    private readonly List<(BoundUserInterface bui, QueuedUpdate updateType, BoundUserInterfaceState? state)> _queuedBuis = new();
+    private readonly List<(BoundUserInterface Bui, bool value)> _queuedBuis = new();
 
     public override void Initialize()
     {
@@ -151,22 +95,9 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
         SubscribeLocalEvent<UserInterfaceUserComponent, ComponentShutdown>(OnActorShutdown);
     }
 
-    /// <summary>
-    /// Enqueues a BUI command to be processed in the next Update call,
-    /// getting the last available state for the given UserInterfaceComponent at the last state.
-    /// </summary>
-    private void AddQueued(BoundUserInterface bui, QueuedUpdate type, Entity<UserInterfaceComponent> ent, Enum key)
+    private void AddQueued(BoundUserInterface bui, bool value)
     {
-        var state = ent.Comp.States.GetValueOrDefault(key);
-        _queuedBuis.Add((bui, type, state));
-    }
-
-    /// <summary>
-    /// Enqueues a BUI command to be processed in the next Update call.
-    /// </summary>
-    private void AddQueued(BoundUserInterface bui, QueuedUpdate type, BoundUserInterfaceState? state = null)
-    {
-        _queuedBuis.Add((bui, type, state));
+        _queuedBuis.Add((bui, value));
     }
 
     /// <summary>
@@ -323,7 +254,7 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
 
         if (ent.Comp.ClientOpenInterfaces.TryGetValue(key, out var cBui))
         {
-            AddQueued(cBui, QueuedUpdate.Close);
+            AddQueued(cBui, false);
         }
 
         if (ent.Comp.Actors.Count == 0)
@@ -365,7 +296,7 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
         // PlayerAttachedEvent will catch some of these.
         foreach (var (key, bui) in ent.Comp.ClientOpenInterfaces)
         {
-            AddQueued(bui, QueuedUpdate.Open, ent, key);
+            AddQueued(bui, true);
         }
     }
 
@@ -385,7 +316,7 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
             DebugTools.Assert(!ent.Comp.Actors.ContainsKey(key));
         }
 
-        DebugTools.Assert(ent.Comp.ClientOpenInterfaces.Values.All(x => _queuedBuis.Contains((x, QueuedUpdate.Close, null))));
+        DebugTools.Assert(ent.Comp.ClientOpenInterfaces.Values.All(x => _queuedBuis.Contains((x, false))));
     }
 
     private void OnUserInterfaceGetState(Entity<UserInterfaceComponent> ent, ref ComponentGetState args)
@@ -546,7 +477,7 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
                 }
 
                 var bui = ent.Comp.ClientOpenInterfaces[key];
-                AddQueued(bui, QueuedUpdate.Close);
+                AddQueued(bui, false);
             }
         }
 
@@ -573,7 +504,9 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
                 if (!ent.Comp.ClientOpenInterfaces.TryGetValue(key, out var cBui) || !cBui.IsOpened)
                     continue;
 
-                AddQueued(cBui, QueuedUpdate.ApplyState, buiState);
+                cBui.State = buiState;
+                cBui.UpdateState(buiState);
+                cBui.Update();
             }
         }
 
@@ -601,7 +534,7 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
         // Existing BUI just keep it.
         if (entity.Comp.ClientOpenInterfaces.TryGetValue(key, out var existing))
         {
-            _queuedBuis.Remove((existing, QueuedUpdate.Close, null));
+            _queuedBuis.Remove((existing, false));
             return;
         }
 
@@ -626,7 +559,7 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
         if (!open)
             return;
 
-        AddQueued(boundUserInterface, QueuedUpdate.Open, entity, key);
+        AddQueued(boundUserInterface, true);
     }
 
     /// <summary>
@@ -1191,18 +1124,15 @@ public abstract partial class SharedUserInterfaceSystem : EntitySystem
     {
         if (_timing.IsFirstTimePredicted)
         {
-            foreach (var (bui, updateType, state) in _queuedBuis)
+            foreach (var (bui, open) in _queuedBuis)
             {
-                if (updateType == QueuedUpdate.Open || updateType == QueuedUpdate.ApplyState)
+                if (open)
                 {
 #if EXCEPTION_TOLERANCE
                     try
                     {
 #endif
-                    if (updateType == QueuedUpdate.Open)
-                    {
-                        bui.Open();
-                    }
+                    bui.Open();
 
                     if (state != null)
                     {
